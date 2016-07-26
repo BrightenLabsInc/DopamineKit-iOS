@@ -10,7 +10,35 @@ import Foundation
 
 class CartridgeSyncer {
     
-    private var mutex_lock:Int = 1
+    private class Mutex_Lock {
+        private var lock = 1
+        func tryLock(automaticUnlock: Bool=true, block: ()->()) {
+            if lock > 0 {
+                lock-=1
+                block()
+                if (automaticUnlock) { lock+=1 }
+            } else {
+                return
+            }
+        }
+        
+        func lock(automaticUnlock: Bool=true, block: ()->()) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0))
+            {
+                while !(self.lock>0) {
+                    sleep(2)
+                }
+                self.lock-=1
+                block()
+                if (automaticUnlock) { self.lock+=1 }
+            }
+        }
+        
+        func unlock() {
+            lock+=1
+        }
+    }
+    private let lock = Mutex_Lock()
     
     private let defaults = NSUserDefaults.standardUserDefaults()
     private let DefaultsKey = "DopamineCartridgeSyncer"
@@ -39,6 +67,7 @@ class CartridgeSyncer {
         if( defaults.valueForKey(key) == nil ){
             defaults.setValue(standardSize, forKey: key)
         }
+        
         TimeSyncer.create(TimeSyncerKey + actionID, ifNotExists: true)
     }
     
@@ -55,70 +84,62 @@ class CartridgeSyncer {
     }
     
     func reload(forced:Bool = false) {
-        if (mutex_lock > 0) {
-            mutex_lock-=1
-        } else {
-            return
-        }
-
-        if SQLCartridgeDataHelper.count(actionID) <= 1 || TimeSyncer.isExpired(TimeSyncerKey + actionID)
-            || forced
-        {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0)) {
-                DopamineKit.DebugLog("Beginning reload...")
-                self.dispatch_async_delayed(1) {
-                    DopamineKit.DebugLog("Sending tracked actions...")
-                    TrackSyncer.sync()
+        lock.tryLock() {
+            
+            if SQLCartridgeDataHelper.count(self.actionID) <= 1 || TimeSyncer.isExpired(self.TimeSyncerKey + self.actionID)
+                || forced
+            {
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0)) {
+                    DopamineKit.DebugLog("Beginning reload...")
                     self.dispatch_async_delayed(1) {
-                        DopamineKit.DebugLog("Sending reported actions...")
-                        ReportSyncer.sync()
-                        self.dispatch_async_delayed(3) {
-                            DopamineAPI.refresh(self.actionID, completion: { response in
-                                // var cartridge = response["cartridge"] as? [String]
-                                // fake load
-                                var cartridge = [ "stars", "thumbsUp", "stars", "neutralFeedback", "neutralFeedback" ]
-                                
-                                SQLCartridgeDataHelper.dropTable(self.actionID)
-                                SQLCartridgeDataHelper.createTable(self.actionID)
-                                TimeSyncer.reset(self.TimeSyncerKey + self.actionID)
-                                self.setCartridgeInitialSize(cartridge.count)
-                                
-                                for decision in cartridge {
-                                    guard let rowId = SQLCartridgeDataHelper.insert(
-                                        SQLCartridge(
-                                            index:0,
-                                            actionID: self.actionID,
-                                            reinforcementDecision: decision)
-                                        )
-                                        else{
-                                            DopamineKit.DebugLog("Couldn't add \(decision) to cartridge sql")
-                                            break
+                        DopamineKit.DebugLog("Sending tracked actions...")
+                        TrackSyncer.sync()
+                        self.dispatch_async_delayed(1) {
+                            DopamineKit.DebugLog("Sending reported actions...")
+                            ReportSyncer.sync()
+                            self.dispatch_async_delayed(3) {
+                                DopamineAPI.refresh(self.actionID, completion: { response in
+                                    // var cartridge = response["cartridge"] as? [String]
+                                    // fake load
+                                    var cartridge = [ "stars", "thumbsUp", "stars", "neutralFeedback", "neutralFeedback" ]
+                                    
+                                    SQLCartridgeDataHelper.dropTable(self.actionID)
+                                    SQLCartridgeDataHelper.createTable(self.actionID)
+                                    TimeSyncer.reset(self.TimeSyncerKey + self.actionID)
+                                    self.setCartridgeInitialSize(cartridge.count)
+                                    
+                                    for decision in cartridge {
+                                        guard let rowId = SQLCartridgeDataHelper.insert(
+                                            SQLCartridge(
+                                                index:0,
+                                                actionID: self.actionID,
+                                                reinforcementDecision: decision)
+                                            )
+                                            else{
+                                                DopamineKit.DebugLog("Couldn't add \(decision) to cartridge sql")
+                                                break
+                                        }
                                     }
-                                }
-                                
-                                DopamineKit.DebugLog("\(self.actionID) refreshed!")
-                                self.mutex_lock+=1
-                            })
+                                    
+                                    DopamineKit.DebugLog("\(self.actionID) refreshed!")
+                                })
+                            }
                         }
                     }
                 }
             }
-        } else {
-            mutex_lock+=1
         }
-        
     }
     
     func pop() -> String {
         var decision = "neutralFeedback"
         
-        if mutex_lock > 0 {
-            mutex_lock-=1
-            if let rdSql = SQLCartridgeDataHelper.findFirst(actionID) {
+        lock.tryLock(){
+            if let rdSql = SQLCartridgeDataHelper.findFirst(self.actionID) {
                 decision = rdSql.reinforcementDecision
                 SQLCartridgeDataHelper.delete(rdSql)
             }
-            mutex_lock+=1
+            
         }
         
         self.reload()
